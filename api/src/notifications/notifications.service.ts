@@ -7,6 +7,11 @@ export const MANDATORY_NOTIFICATION_CATEGORIES = ['compliance', 'security', 'set
 export type OptionalNotificationCategory = typeof OPTIONAL_NOTIFICATION_CATEGORIES[number];
 export type NotificationCategory = OptionalNotificationCategory | typeof MANDATORY_NOTIFICATION_CATEGORIES[number];
 
+/**
+ * Routing table: every known notification type maps to a category so the
+ * delivery engine can decide mandatory vs optional without callers having
+ * to know the category.
+ */
 const TYPE_CATEGORY: Record<string, NotificationCategory> = {
   BOND_ISSUED: 'bond_updates',
   COUPON_DISTRIBUTED: 'coupon_updates',
@@ -53,11 +58,32 @@ export interface NotificationQuery {
   type?: string;
 }
 
+/**
+ * One entry in the durable preference change history.
+ *
+ * Stored in `notification_preference_history` so operators can audit when
+ * and why a user changed their optional-category opt-ins, and so that
+ * mandatory-category override events are permanently visible.
+ */
+export interface PreferenceHistoryEntry {
+  id: string;
+  userId: string;
+  changedAt: string;
+  /** Snapshot of preferences before this change. */
+  before: Record<OptionalNotificationCategory, boolean>;
+  /** Snapshot of preferences after this change. */
+  after: Record<OptionalNotificationCategory, boolean>;
+  /** Free-text reason supplied by the caller (defaults to 'user_request'). */
+  reason: string;
+}
+
 @Injectable()
 export class NotificationsService implements OnModuleInit, OnModuleDestroy {
   private notifications: Notification[] = [];
   private preferences = new Map<string, Record<OptionalNotificationCategory, boolean>>();
   private decisions: NotificationDecision[] = [];
+  /** In-memory fallback for preference history when no DB is configured. */
+  private preferenceHistory: PreferenceHistoryEntry[] = [];
   private readonly pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
   private readonly logger = new Logger(NotificationsService.name);
 
@@ -72,6 +98,22 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       mandatory BOOLEAN NOT NULL, decided_at TIMESTAMPTZ NOT NULL,
       UNIQUE (user_id, event_id)
     )`);
+    /**
+     * Durable preference-change audit trail.  Each row captures a before/after
+     * snapshot so mandatory-override events and user opt-outs are permanently
+     * visible to operators.
+     */
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS notification_preference_history (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      changed_at TIMESTAMPTZ NOT NULL,
+      before_prefs JSONB NOT NULL,
+      after_prefs  JSONB NOT NULL,
+      reason TEXT NOT NULL DEFAULT 'user_request'
+    )`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS notification_preference_history_user_idx
+      ON notification_preference_history (user_id, changed_at DESC)`);
+
     const rows = await this.pool.query('SELECT user_id, preferences FROM notification_preferences');
     for (const row of rows.rows) this.preferences.set(row.user_id, row.preferences);
   }
@@ -84,55 +126,181 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
     return { bond_updates: true, coupon_updates: true, project_reports: true, ...this.preferences.get(userId) };
   }
 
-  async setPreferences(userId: string, updates: unknown): Promise<Record<OptionalNotificationCategory, boolean>> {
+  async setPreferences(
+    userId: string,
+    updates: unknown,
+    reason = 'user_request',
+  ): Promise<Record<OptionalNotificationCategory, boolean>> {
     if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
       throw new BadRequestException('Preferences must be an object');
     }
     for (const [key, value] of Object.entries(updates)) {
+      // Mandatory categories may never be disabled through the preferences API.
+      if ((MANDATORY_NOTIFICATION_CATEGORIES as readonly string[]).includes(key)) {
+        throw new BadRequestException(
+          `Cannot change mandatory notification category: ${key}`,
+        );
+      }
       if (!OPTIONAL_NOTIFICATION_CATEGORIES.includes(key as OptionalNotificationCategory) || typeof value !== 'boolean') {
         throw new BadRequestException(`Invalid optional notification preference: ${key}`);
       }
     }
-    const next = { ...this.getPreferences(userId), ...updates };
+
+    const before = this.getPreferences(userId);
+    const next = { ...before, ...(updates as Record<string, boolean>) };
+
     if (this.pool) {
-      await this.pool.query(`INSERT INTO notification_preferences (user_id, preferences) VALUES ($1, $2)
-        ON CONFLICT (user_id) DO UPDATE SET preferences = EXCLUDED.preferences`, [userId, JSON.stringify(next)]);
+      await this.pool.query(
+        `INSERT INTO notification_preferences (user_id, preferences) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET preferences = EXCLUDED.preferences`,
+        [userId, JSON.stringify(next)],
+      );
     }
     this.preferences.set(userId, next);
+
+    // Record preference change in durable audit trail.
+    await this.recordPreferenceHistory(userId, before, next, reason);
+
     return { ...next };
+  }
+
+  private async recordPreferenceHistory(
+    userId: string,
+    before: Record<OptionalNotificationCategory, boolean>,
+    after: Record<OptionalNotificationCategory, boolean>,
+    reason: string,
+  ): Promise<void> {
+    const entry: PreferenceHistoryEntry = {
+      id: randomUUID(),
+      userId,
+      changedAt: new Date().toISOString(),
+      before,
+      after,
+      reason,
+    };
+    this.preferenceHistory.push(entry);
+
+    if (this.pool) {
+      await this.pool
+        .query(
+          `INSERT INTO notification_preference_history
+             (id, user_id, changed_at, before_prefs, after_prefs, reason)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            entry.id,
+            entry.userId,
+            entry.changedAt,
+            JSON.stringify(entry.before),
+            JSON.stringify(entry.after),
+            entry.reason,
+          ],
+        )
+        .catch((error) =>
+          this.logger.error('Preference history write failed', error),
+        );
+    }
+  }
+
+  /**
+   * Return the full preference-change history for a user, newest first.
+   * Mandatory-override attempts that were rejected are NOT recorded here
+   * because they never succeed; the audit trail for attempted overrides lives
+   * in notification_decisions (delivered=false rows for mandatory categories).
+   */
+  async getPreferenceHistory(userId: string): Promise<PreferenceHistoryEntry[]> {
+    if (this.pool) {
+      const rows = await this.pool.query(
+        `SELECT id, user_id, changed_at, before_prefs, after_prefs, reason
+           FROM notification_preference_history
+          WHERE user_id = $1
+          ORDER BY changed_at DESC`,
+        [userId],
+      );
+      return rows.rows.map((row) => ({
+        id: row.id,
+        userId: row.user_id,
+        changedAt: new Date(row.changed_at).toISOString(),
+        before: row.before_prefs as Record<OptionalNotificationCategory, boolean>,
+        after: row.after_prefs as Record<OptionalNotificationCategory, boolean>,
+        reason: row.reason as string,
+      }));
+    }
+    return this.preferenceHistory
+      .filter((e) => e.userId === userId)
+      .slice()
+      .reverse();
   }
 
   async getDecisions(userId: string): Promise<NotificationDecision[]> {
     if (this.pool) {
-      const rows = await this.pool.query(`SELECT user_id, event_id, type, category, delivered, mandatory, decided_at
-        FROM notification_decisions WHERE user_id = $1 ORDER BY id DESC`, [userId]);
-      return rows.rows.map(row => ({ userId: row.user_id, eventId: row.event_id, type: row.type,
-        category: row.category, delivered: row.delivered, mandatory: row.mandatory,
-        decidedAt: new Date(row.decided_at).toISOString() }));
+      const rows = await this.pool.query(
+        `SELECT user_id, event_id, type, category, delivered, mandatory, decided_at
+           FROM notification_decisions WHERE user_id = $1 ORDER BY id DESC`,
+        [userId],
+      );
+      return rows.rows.map((row) => ({
+        userId: row.user_id,
+        eventId: row.event_id,
+        type: row.type,
+        category: row.category,
+        delivered: row.delivered,
+        mandatory: row.mandatory,
+        decidedAt: new Date(row.decided_at).toISOString(),
+      }));
     }
-    return this.decisions.filter(decision => decision.userId === userId).map(decision => ({ ...decision }));
+    return this.decisions
+      .filter((decision) => decision.userId === userId)
+      .map((decision) => ({ ...decision }));
   }
 
   createNotification(data: Omit<Notification, 'id' | 'read' | 'createdAt'>): Notification | null {
     // Deduplication check
-    const existing = this.notifications.find(n => n.eventId === data.eventId && n.userId === data.userId);
+    const existing = this.notifications.find(
+      (n) => n.eventId === data.eventId && n.userId === data.userId,
+    );
     if (existing) {
       return null;
     }
 
     const category = TYPE_CATEGORY[data.type] ?? 'bond_updates';
     const mandatory = (MANDATORY_NOTIFICATION_CATEGORIES as readonly string[]).includes(category);
-    const delivered = mandatory || this.getPreferences(data.userId)[category as OptionalNotificationCategory];
-    const decision = { userId: data.userId, eventId: data.eventId, type: data.type,
-      category, delivered, mandatory, decidedAt: new Date().toISOString() };
+    const delivered =
+      mandatory || this.getPreferences(data.userId)[category as OptionalNotificationCategory];
+
+    const decision: NotificationDecision = {
+      userId: data.userId,
+      eventId: data.eventId,
+      type: data.type,
+      category,
+      delivered,
+      mandatory,
+      decidedAt: new Date().toISOString(),
+    };
     this.decisions.push(decision);
+
     if (this.pool) {
-      void this.pool.query(`INSERT INTO notification_decisions
-        (user_id, event_id, type, category, delivered, mandatory, decided_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (user_id, event_id) DO NOTHING`,
-      [decision.userId, decision.eventId, decision.type, decision.category, decision.delivered,
-        decision.mandatory, decision.decidedAt]).catch(error => this.logger.error('Notification decision audit write failed', error));
+      void this.pool
+        .query(
+          `INSERT INTO notification_decisions
+             (user_id, event_id, type, category, delivered, mandatory, decided_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (user_id, event_id) DO NOTHING`,
+          [
+            decision.userId,
+            decision.eventId,
+            decision.type,
+            decision.category,
+            decision.delivered,
+            decision.mandatory,
+            decision.decidedAt,
+          ],
+        )
+        .catch((error) =>
+          this.logger.error('Notification decision audit write failed', error),
+        );
     }
+
     if (!delivered) return null;
 
     const notification: Notification = {
@@ -155,8 +323,15 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
   }
 
-  markAsRead(userId: string, id: string): Notification | undefined {
-    const notification = this.notifications.find(n => n.id === id && n.userId === userId);
+  /** Count unread notifications for a user's inbox. */
+  countUnread(userId: string): number {
+    return this.notifications.filter((n) => n.userId === userId && !n.read).length;
+  }
+
+  markAsRead(userId: string, id: string, now: Date = new Date()): Notification | null {
+    const notification = this.notifications.find(
+      (n) => n.id === id && n.userId === userId,
+    );
     if (notification && !notification.read) {
       notification.read = true;
       notification.readAt = now.toISOString();

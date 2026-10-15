@@ -43,6 +43,16 @@ export class NotificationsController {
   }
 
   /**
+   * Durable audit trail of every preference change the user (or an admin
+   * acting on their behalf) has made.  Mandatory categories are immutable
+   * and never appear here; they are permanently visible in `GET /decisions`.
+   */
+  @Get('preferences/history')
+  async getPreferenceHistory(@Req() req: AuthenticatedRequest) {
+    return this.notificationsService.getPreferenceHistory(req.user.walletAddress);
+  }
+
+  /**
    * The inbox, newest first. `?unread=true` and `?type=` filter explicitly;
    * without them the read flag removes nothing, so a caller always knows
    * whether it is looking at everything or a subset.

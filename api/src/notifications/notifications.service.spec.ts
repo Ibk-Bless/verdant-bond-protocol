@@ -101,4 +101,69 @@ describe('NotificationsService', () => {
     expect(service.getPreferences('user1').bond_updates).toBe(false);
     expect(service.getPreferences('user2').bond_updates).toBe(true);
   });
+
+  // ── Issue #384: durable preference history & mandatory-alert routing ────────
+
+  it('records a preference change in the audit history', async () => {
+    await service.setPreferences('user1', { bond_updates: false }, 'user_opted_out');
+    const history = await service.getPreferenceHistory('user1');
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({
+      userId: 'user1',
+      reason: 'user_opted_out',
+      before: expect.objectContaining({ bond_updates: true }),
+      after: expect.objectContaining({ bond_updates: false }),
+    });
+    expect(history[0].changedAt).toBeDefined();
+    expect(history[0].id).toBeDefined();
+  });
+
+  it('accumulates preference history across multiple changes, newest first', async () => {
+    await service.setPreferences('user1', { bond_updates: false });
+    await service.setPreferences('user1', { bond_updates: true });
+    const history = await service.getPreferenceHistory('user1');
+    expect(history).toHaveLength(2);
+    // newest-first: last change is at index 0
+    expect(history[0].after).toMatchObject({ bond_updates: true });
+    expect(history[1].after).toMatchObject({ bond_updates: false });
+  });
+
+  it('preference history is isolated per user', async () => {
+    await service.setPreferences('userA', { coupon_updates: false });
+    await service.setPreferences('userB', { project_reports: false });
+    expect(await service.getPreferenceHistory('userA')).toHaveLength(1);
+    expect(await service.getPreferenceHistory('userB')).toHaveLength(1);
+    expect((await service.getPreferenceHistory('userA'))[0].before).toMatchObject({ coupon_updates: true });
+  });
+
+  it('rejects attempts to disable mandatory categories via setPreferences', async () => {
+    for (const cat of ['compliance', 'security', 'settlement_failure'] as const) {
+      await expect(
+        service.setPreferences('user1', { [cat]: false }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    // No history entry created for rejected calls.
+    expect(await service.getPreferenceHistory('user1')).toHaveLength(0);
+  });
+
+  it('getPreferenceHistory returns empty array for a user with no changes', async () => {
+    expect(await service.getPreferenceHistory('never-changed')).toEqual([]);
+  });
+
+  it('mandatory notifications are delivered regardless of all optional prefs being false', async () => {
+    await service.setPreferences('user1', {
+      bond_updates: false,
+      coupon_updates: false,
+      project_reports: false,
+    });
+    const n = service.createNotification({
+      userId: 'user1',
+      type: 'COMPLIANCE_ALERT',
+      message: 'KYC lapsed',
+      eventId: 'evt-kyc',
+    });
+    expect(n).not.toBeNull();
+    expect(n!.mandatory).toBe(true);
+    expect(n!.category).toBe('compliance');
+  });
 });
